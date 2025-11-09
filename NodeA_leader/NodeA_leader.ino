@@ -1,16 +1,15 @@
 #include <WiFi.h>
 #include <esp_now.h>
-#include <vector>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include "esp_wifi.h"
+#include <vector>
 
-// ---------- CONFIG ----------
-uint8_t nodeBMac[] = {0xB0,0xA7,0x32,0x2B,0x53,0x40}; // Node B STA MAC
-const char* serverURL = "http://172.20.10.12:5000/upload_block"; // Flask server
+uint8_t nodeBMac[] = {0xB0,0xA7,0x32,0x2B,0x53,0x40}; // Node B MAC
 const int MAX_BLOCKS_IN_RAM = 10;
-const long interval = 10000; // 10 s
-// ----------------------------
+const long interval = 5000;
+
+enum MsgType : uint8_t { NEW_BLOCK = 0, CHANNEL_SYNC = 99, SYNC_ACK = 100 };
 
 struct Block {
   int index;
@@ -19,148 +18,133 @@ struct Block {
   String hash;
   unsigned long timestamp;
 };
-
 std::vector<Block> blockchain;
 
-String calcHash(int i,float d,String p,unsigned long t){
-  return String(i)+"-"+String(d)+"-"+p+"-"+String(t);
-}
-Block createBlock(float distance){
-  Block b;
-  b.index=blockchain.empty()?0:blockchain.back().index+1;
-  b.distance=distance;
-  b.timestamp=millis();
-  b.prevHash=blockchain.empty()?"GENESIS_HASH":blockchain.back().hash;
-  b.hash=calcHash(b.index,b.distance,b.prevHash,b.timestamp);
-  return b;
-}
-String fmtTime(unsigned long ms){
-  unsigned long s=ms/1000,h=s/3600,m=(s%3600)/60; s%=60;
-  char buf[9]; sprintf(buf,"%02lu:%02lu:%02lu",h,m,s); return String(buf);
-}
+String ssid, password, serverURL;
 #define GREEN "\033[32m"
 #define RESET "\033[0m"
 
-// ---------- Wi-Fi ----------
-String ssid, password;
-void connectWiFiDynamic(){
-  Serial.println("\nEnter Wi-Fi SSID:");
-  while (Serial.available()==0);
-  ssid = Serial.readStringUntil('\n');
-  ssid.trim();
+bool ackReceived = false;
 
-  Serial.println("Enter Wi-Fi Password:");
-  while (Serial.available()==0);
-  password = Serial.readStringUntil('\n');
-  password.trim();
-
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid.c_str(), password.c_str());
-  Serial.print("Connecting to "); Serial.println(ssid);
-  int t=0;
-  while (WiFi.status()!=WL_CONNECTED && t<30){ delay(500); Serial.print("."); t++; }
-  if (WiFi.status()==WL_CONNECTED){
-    Serial.println("\n✅ Wi-Fi connected!");
-    Serial.print("IP: "); Serial.println(WiFi.localIP());
-  } else Serial.println("\n⚠️ Wi-Fi connect failed, continuing offline.");
+// ---------- Utility ----------
+String calcHash(int i,float d,String p,unsigned long t){
+  return String(i)+"-"+String(d)+"-"+p+"-"+String(t);
+}
+Block createBlock(float d){
+  Block b;
+  b.index = blockchain.empty()?0:blockchain.back().index+1;
+  b.distance=d; b.timestamp=millis();
+  b.prevHash = blockchain.empty()?"GENESIS_HASH":blockchain.back().hash;
+  b.hash = calcHash(b.index,b.distance,b.prevHash,b.timestamp);
+  return b;
+}
+float getReading(){ return random(50,150)/1.0; }
+String fmt(unsigned long ms){ unsigned long s=ms/1000; char buf[9];
+  sprintf(buf,"%02lu:%02lu:%02lu",s/3600,(s%3600)/60,s%60); return String(buf);
 }
 
-// ---------- ESP-NOW ----------
-void sendBlock(Block &b){
-  String payload=String(b.index)+","+String(b.distance)+","+b.prevHash+","+b.hash+","+String(b.timestamp);
-  String msg="0|"+payload;
-  esp_err_t r=esp_now_send(nodeBMac,(uint8_t*)msg.c_str(),msg.length()+1);
-  if(r==ESP_OK) Serial.println(GREEN "📤 Packet sent successfully" RESET);
-  else Serial.println("⚠️ Packet send failed");
+// ---------- Input ----------
+String readLine(const char *prompt){
+  Serial.println(prompt);
+  while(!Serial.available());
+  String s=Serial.readStringUntil('\n'); s.trim(); return s;
 }
 
 // ---------- Offload ----------
-void offloadBlock(Block &b){
+void offloadBlock(const Block &b,String url){
   if(WiFi.status()!=WL_CONNECTED) return;
-  HTTPClient http; http.begin(serverURL); http.addHeader("Content-Type","application/json");
-  StaticJsonDocument<256> doc;
-  doc["index"]=b.index; doc["distance"]=b.distance;
-  doc["prevHash"]=b.prevHash; doc["hash"]=b.hash; doc["timestamp"]=b.timestamp;
-  String payload; serializeJson(doc,payload);
+  HTTPClient http; http.begin(url); http.addHeader("Content-Type","application/json");
+  StaticJsonDocument<256> d;
+  d["index"]=b.index; d["distance"]=b.distance; d["prevHash"]=b.prevHash;
+  d["hash"]=b.hash; d["timestamp"]=b.timestamp;
+  String payload; serializeJson(d,payload);
   int code=http.POST(payload);
-  Serial.printf("🌐 Offload Block #%d → %d\n",b.index,code);
+  Serial.printf("🌐 Offloaded #%d → %d\n",b.index,code);
   http.end();
 }
-void trimBlockchain(){
+void trim(){
   while(blockchain.size()>MAX_BLOCKS_IN_RAM){
-    offloadBlock(blockchain.front());
+    offloadBlock(blockchain.front(),serverURL);
     blockchain.erase(blockchain.begin());
   }
 }
 
+// ---------- ESP-NOW ----------
+void sendPacket(uint8_t t,String p){
+  String m=String(t)+"|"+p;
+  esp_now_send(nodeBMac,(uint8_t*)m.c_str(),m.length()+1);
+}
+
+void onReceive(const esp_now_recv_info_t *info,const uint8_t *data,int len){
+  String msg;
+  for(int i=0;i<len;i++) msg+=(char)data[i];
+  int sep=msg.indexOf('|'); if(sep==-1)return;
+  uint8_t type=msg.substring(0,sep).toInt();
+  if(type==SYNC_ACK){
+    ackReceived=true;
+    Serial.println(GREEN "🤝 Node B acknowledged channel sync!" RESET);
+  }
+}
+
 // ---------- Setup ----------
-void setup() {
+void setup(){
   Serial.begin(115200);
   Serial.println("\n🚀 Node A starting...");
 
-  // --- 1️⃣ Ask for Wi-Fi credentials dynamically ---
-  Serial.println("Enter Wi-Fi SSID:");
-  while (Serial.available() == 0);
-  String ssid = Serial.readStringUntil('\n'); ssid.trim();
+  String ip = readLine("Enter Flask server IP (e.g. 192.168.0.202):");
+  serverURL = "http://" + ip + ":5000/upload_block";
+  ssid = readLine("Enter Wi-Fi SSID:");
+  password = readLine("Enter Wi-Fi Password:");
 
-  Serial.println("Enter Wi-Fi Password:");
-  while (Serial.available() == 0);
-  String password = Serial.readStringUntil('\n'); password.trim();
-
-  // --- 2️⃣ Connect to Wi-Fi ---
   WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid.c_str(), password.c_str());
-  Serial.print("Connecting to "); Serial.println(ssid);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+  WiFi.begin(ssid.c_str(),password.c_str());
+  Serial.print("Connecting");
+  int t=0;
+  while(WiFi.status()!=WL_CONNECTED && t<30){ delay(500); Serial.print("."); t++; }
+  Serial.println();
+  if(WiFi.status()==WL_CONNECTED){
+    Serial.println("✅ Wi-Fi connected");
+    Serial.print("IP: "); Serial.println(WiFi.localIP());
+  } else Serial.println("❌ Wi-Fi failed");
+
+  wifi_second_chan_t sc; uint8_t ch;
+  esp_wifi_get_channel(&ch,&sc);
+  Serial.printf("📶 Wi-Fi channel detected: %d\n",ch);
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(ch,WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+
+  if(esp_now_init()!=ESP_OK){ Serial.println("❌ ESP-NOW init failed"); return; }
+  esp_now_register_recv_cb(onReceive);
+  esp_now_peer_info_t p{}; memcpy(p.peer_addr,nodeBMac,6); p.channel=ch; p.encrypt=false;
+  esp_now_add_peer(&p);
+  Serial.println("✅ Peer added");
+
+  delay(1000);  // allow Node B radio to wake up
+
+  unsigned long start = millis();
+  while(!ackReceived && millis()-start < 8000){
+    sendPacket(CHANNEL_SYNC,String(ch));
+    Serial.printf("📡 Sent channel sync → %d\n",ch);
+    delay(1000);
   }
-  Serial.println("\n✅ Wi-Fi connected!");
-  Serial.print("IP: "); Serial.println(WiFi.localIP());
 
-  // --- 3️⃣ Get and print actual Wi-Fi channel ---
-  wifi_second_chan_t sc;
-  uint8_t currentChannel;
-  esp_wifi_get_channel(&currentChannel, &sc);
-  Serial.print("📶 Wi-Fi channel in use: ");
-  Serial.println(currentChannel);
-
-  // --- 4️⃣ Init ESP-NOW fresh on the same channel ---
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("❌ ESP-NOW init failed!");
-    return;
-  }
-  esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
-
-  // --- 5️⃣ Add Node B as peer on this channel ---
-  esp_now_peer_info_t peer{};
-  memcpy(peer.peer_addr, nodeBMac, 6);
-  peer.channel = currentChannel;    // <-- key line
-  peer.encrypt = false;
-  if (esp_now_add_peer(&peer) == ESP_OK)
-    Serial.println("✅ Peer added");
-  else
-    Serial.println("❌ Peer add failed");
-
-  // --- 6️⃣ Genesis block ---
-  Block g{0, 0, "0", "GENESIS_HASH", 0};
-  blockchain.push_back(g);
+  blockchain.push_back({0,0,"0","GENESIS_HASH",0});
   Serial.println(GREEN "✅ Blockchain initialized" RESET);
 }
 
-
 // ---------- Loop ----------
-unsigned long lastBlock=0;
-float getReading(){ return random(50,150)/1.0; }
+unsigned long last=0;
 void loop(){
-  if(millis()-lastBlock>=interval){
-    lastBlock=millis();
+  if(millis()-last>=interval){
+    last=millis();
     Block b=createBlock(getReading());
     blockchain.push_back(b);
-    trimBlockchain();
-
-    Serial.printf(GREEN "\n📦 Block #%d | Dist: %.2f | Time: %s\n" RESET,
-                  b.index,b.distance,fmtTime(b.timestamp).c_str());
-    sendBlock(b);
+    trim();
+    Serial.printf(GREEN "\n📦 Block #%d | %.2f cm | %s\n" RESET,
+                  b.index,b.distance,fmt(b.timestamp).c_str());
+    sendPacket(NEW_BLOCK,
+               String(b.index)+","+String(b.distance)+","+
+               b.prevHash+","+b.hash+","+String(b.timestamp));
   }
 }
