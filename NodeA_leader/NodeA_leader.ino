@@ -5,10 +5,15 @@
 #include "esp_wifi.h"
 #include <vector>
 
-uint8_t nodeBMac[] = {0xB0,0xA7,0x32,0x2B,0x53,0x40}; // Node B MAC
-const int MAX_BLOCKS_IN_RAM = 10;
-const long interval = 5000;
+// ---------- USER CONFIG ----------
+#define TRIG_PIN 4   // Change if wired differently
+#define ECHO_PIN 5
 
+uint8_t nodeBMac[] = {0xB0,0xA7,0x32,0x2B,0x53,0x40};  // Node B MAC
+const int MAX_BLOCKS_IN_RAM = 10;
+const long interval = 5000; // every 30 seconds
+
+// ---------- STRUCTURES ----------
 enum MsgType : uint8_t { NEW_BLOCK = 0, CHANNEL_SYNC = 99, SYNC_ACK = 100 };
 
 struct Block {
@@ -38,9 +43,24 @@ Block createBlock(float d){
   b.hash = calcHash(b.index,b.distance,b.prevHash,b.timestamp);
   return b;
 }
-float getReading(){ return random(50,150)/1.0; }
-String fmt(unsigned long ms){ unsigned long s=ms/1000; char buf[9];
-  sprintf(buf,"%02lu:%02lu:%02lu",s/3600,(s%3600)/60,s%60); return String(buf);
+String fmt(unsigned long ms){
+  unsigned long s=ms/1000; char buf[9];
+  sprintf(buf,"%02lu:%02lu:%02lu",s/3600,(s%3600)/60,s%60);
+  return String(buf);
+}
+
+// ---------- Ultrasonic Sensor ----------
+float getReading() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 25000); // 25 ms timeout
+  float distance = duration * 0.0343 / 2.0; // cm
+  if (distance <= 0 || distance > 400) distance = NAN; // invalid
+  return distance;
 }
 
 // ---------- Input ----------
@@ -91,6 +111,9 @@ void setup(){
   Serial.begin(115200);
   Serial.println("\n🚀 Node A starting...");
 
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
   String ip = readLine("Enter Flask server IP (e.g. 192.168.0.202):");
   serverURL = "http://" + ip + ":5000/upload_block";
   ssid = readLine("Enter Wi-Fi SSID:");
@@ -107,6 +130,7 @@ void setup(){
     Serial.print("IP: "); Serial.println(WiFi.localIP());
   } else Serial.println("❌ Wi-Fi failed");
 
+  // ---------- Channel Lock ----------
   wifi_second_chan_t sc; uint8_t ch;
   esp_wifi_get_channel(&ch,&sc);
   Serial.printf("📶 Wi-Fi channel detected: %d\n",ch);
@@ -114,13 +138,14 @@ void setup(){
   esp_wifi_set_channel(ch,WIFI_SECOND_CHAN_NONE);
   esp_wifi_set_promiscuous(false);
 
+  // ---------- ESP-NOW Init ----------
   if(esp_now_init()!=ESP_OK){ Serial.println("❌ ESP-NOW init failed"); return; }
   esp_now_register_recv_cb(onReceive);
   esp_now_peer_info_t p{}; memcpy(p.peer_addr,nodeBMac,6); p.channel=ch; p.encrypt=false;
   esp_now_add_peer(&p);
   Serial.println("✅ Peer added");
 
-  delay(1000);  // allow Node B radio to wake up
+  delay(1000);  // wait for Node B
 
   unsigned long start = millis();
   while(!ackReceived && millis()-start < 8000){
@@ -138,11 +163,20 @@ unsigned long last=0;
 void loop(){
   if(millis()-last>=interval){
     last=millis();
-    Block b=createBlock(getReading());
+
+    float distance = getReading();
+    if (isnan(distance)) {
+      Serial.println("⚠️ Invalid ultrasonic reading, skipping this cycle");
+      return;
+    }
+
+    Block b=createBlock(distance);
     blockchain.push_back(b);
     trim();
+
     Serial.printf(GREEN "\n📦 Block #%d | %.2f cm | %s\n" RESET,
                   b.index,b.distance,fmt(b.timestamp).c_str());
+
     sendPacket(NEW_BLOCK,
                String(b.index)+","+String(b.distance)+","+
                b.prevHash+","+b.hash+","+String(b.timestamp));
